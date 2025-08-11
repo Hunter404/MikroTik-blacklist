@@ -1,0 +1,123 @@
+name: Build blacklist (ips.txt)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 0"   # Sundays 03:00 UTC
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-blacklist
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate ips.txt
+        env:
+          # Put only IP/CIDR sources here (domain lists won't work)
+          SOURCES: |
+            https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset
+          OUTPUT: ips.txt
+          MIN_LINES: "100"          # fail-safe: don't publish if too tiny
+          EXCLUDE_RFC1918: "true"   # skip private/loopback/link-local/reserved
+        run: |
+          python3 - <<'PY'
+          import os, sys, urllib.request, ipaddress, datetime
+
+          sources = [s.strip() for s in os.environ["SOURCES"].splitlines() if s.strip() and not s.strip().startswith("#")]
+          output  = os.environ.get("OUTPUT", "ips.txt")
+          min_lines = int(os.environ.get("MIN_LINES","0"))
+          exclude_rfc1918 = os.environ.get("EXCLUDE_RFC1918","true").lower() == "true"
+
+          def fetch(url):
+            with urllib.request.urlopen(url, timeout=60) as r:
+              return r.read().decode("utf-8", errors="ignore")
+
+          raw = []
+          for url in sources:
+            try:
+              raw.append(fetch(url))
+              print(f"Fetched: {url}")
+            except Exception as e:
+              print(f"FAILED: {url} -> {e}", file=sys.stderr)
+
+          if not raw:
+            print("No sources fetched; aborting.", file=sys.stderr)
+            sys.exit(1)
+
+          # Parse + validate
+          nets = []
+          for blob in raw:
+            for line in blob.splitlines():
+              line = line.strip()
+              if not line or line.startswith("#") or line.startswith(";"):
+                continue
+              # Strip inline comments like "1.2.3.0/24 # note"
+              if "#" in line:
+                line = line.split("#",1)[0].strip()
+              if ";" in line:
+                line = line.split(";",1)[0].strip()
+              if not line:
+                continue
+              try:
+                n = ipaddress.ip_network(line, strict=False)
+              except Exception:
+                # Some lists use "1.2.3.4 - 1.2.3.9" ranges; ignore by default or add your own parser
+                continue
+
+              # Optionally skip private/reserved/etc
+              if exclude_rfc1918:
+                if (
+                  n.is_private or n.is_loopback or n.is_link_local or n.is_multicast or
+                  n.is_reserved or n.is_unspecified
+                ):
+                  continue
+
+              nets.append(n)
+
+          if not nets:
+            print("No valid IP/CIDR entries parsed; aborting.", file=sys.stderr)
+            sys.exit(1)
+
+          # Collapse/merge overlapping ranges & sort (IPv4 first, then IPv6)
+          collapsed = list(ipaddress.collapse_addresses(nets))
+          v4 = sorted([n for n in collapsed if isinstance(n, ipaddress.IPv4Network)], key=lambda n: (int(n.network_address), n.prefixlen))
+          v6 = sorted([n for n in collapsed if isinstance(n, ipaddress.IPv6Network)], key=lambda n: (int(n.network_address), n.prefixlen))
+          merged = v4 + v6
+
+          if len(merged) < min_lines:
+            print(f"Too few lines after merge: {len(merged)} < {min_lines}; aborting.", file=sys.stderr)
+            sys.exit(1)
+
+          # Write output with header; RouterOS ignores lines starting with '#'
+          header = [
+            "# Built by GitHub Actions",
+            f"# Generated: {datetime.datetime.utcnow().isoformat()}Z",
+            "# Format: one IPv4/IPv6 or CIDR per line",
+          ]
+          with open(output, "w", newline="\n") as f:
+            for h in header:
+              f.write(h+"\n")
+            for n in merged:
+              f.write(str(n)+"\n")
+
+          print(f"Wrote {output} with {len(merged)} entries.")
+          PY
+
+      - name: Commit ips.txt if changed
+        run: |
+          if ! git diff --quiet -- ips.txt; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add ips.txt
+            git commit -m "chore: update ips.txt ($(date -u +%F))"
+            git push
+          else
+            echo "No changes to commit."
+          fi
