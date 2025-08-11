@@ -110,14 +110,45 @@ jobs:
           print(f"Wrote {output} with {len(merged)} entries.")
           PY
 
-      - name: Commit ips.txt if changed
+      - name: Split into chunks + manifest
         run: |
-          if ! git diff --quiet -- ips.txt; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add ips.txt
-            git commit -m "chore: update ips.txt ($(date -u +%F))"
-            git push
+          python3 - <<'PY'
+          import os, math
+          src = "ips.txt"
+          max_bytes = 50*1024
+          with open(src,"rb") as f: data = f.read()
+          parts = []
+          start = 0
+          while start < len(data):
+              end = min(start+max_bytes, len(data))
+              # don’t cut mid-line
+              if end < len(data):
+                  nl = data.rfind(b"\n", start, end)
+                  if nl > start: end = nl+1
+              part = data[start:end]
+              name = f"ips-{len(parts):03}.txt"
+              with open(name,"wb") as o: o.write(part)
+              parts.append(name)
+              start = end
+          with open("manifest.txt","w") as m:
+              for p in parts: m.write(p+"\n")
+          print(f"Chunks: {len(parts)}")
+          PY
+
+      - name: Commit chunks if changed
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Stage generated files (ok if some don't exist yet)
+          git add manifest.txt || true
+          git add ips-*.txt 2>/dev/null || true
+
+          # Commit only if something is staged
+          if git diff --cached --quiet; then
+            echo "No chunk changes."
           else
-            echo "No changes to commit."
+            git commit -m "chore: split ips.txt into chunks"
+            git push
           fi
